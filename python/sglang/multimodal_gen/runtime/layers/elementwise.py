@@ -1,0 +1,58 @@
+import torch
+
+from sglang.kernels.ops.diffusion import fuse_scale_shift_kernel
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+
+
+class MulAdd(CustomOp):
+    """
+    Fuse elementwise mul and add
+    Input: a, b, c, OptionalInt[k]
+    Output: a * (k + b) + c
+    """
+
+    def __init__(self, prefix: str = ""):
+        super().__init__()
+
+    def forward_native(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ) -> torch.Tensor:
+        # a.shape: [batch_size, seq_len, inner_dim]
+        if b.dim() == 4:
+            # b.shape: [batch_size, num_frames, 1, inner_dim]
+            num_frames = b.shape[1]
+            frame_seqlen = a.shape[1] // num_frames
+            return c + (
+                a.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (k + b)
+            ).flatten(1, 2)
+        else:
+            # b.shape: [batch_size, 1, inner_dim]
+            return c + a * (k + b)
+
+    def forward_cuda(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ):
+        return fuse_scale_shift_kernel(a, b, c, scale_constant=k)
+
+    def forward_xpu(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ):
+        return self.forward_native(a, b, c, k=k).to(a.dtype)
+
+    @torch.compile
+    def forward_musa(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ):
+        return self.forward_native(a, b, c, k=k)
+
+    def forward_npu(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ):
+        # The kernel flattens b to a single [inner_dim] row, so anything wider
+        # (per-frame [B, F, 1, C] with F > 1, or batch > 1) needs the eager path.
+        if b.numel() != a.shape[-1]:
+            return self.forward_native(a, b, c, k=k)
+
+        from sgl_kernel_npu.operators.elementwise import fused_scale_shift
+
+        return fused_scale_shift(a, b, c, scale_constant=k)
